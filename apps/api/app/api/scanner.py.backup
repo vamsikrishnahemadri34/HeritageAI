@@ -1,0 +1,280 @@
+﻿from io import BytesIO
+import os
+import logging
+
+from pydantic import BaseModel, Field
+from google import genai
+from google.genai import types
+
+import pytesseract
+from PIL import (
+    Image,
+    ImageOps,
+    ImageEnhance,
+    UnidentifiedImageError,
+)
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from sqlalchemy.orm import Session
+
+from app.api.auth import get_db
+from app.api.users import get_current_user
+from app.models import User
+
+pytesseract.pytesseract.tesseract_cmd = (
+    r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+)
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/scanner", tags=["Heritage Scanner"])
+
+MAX_IMAGE_SIZE = 10 * 1024 * 1024
+
+OCR_MODELS = {
+    "eng": "English",
+    "tel": "Telugu",
+    "hin": "Devanagari (Hindi/Sanskrit)",
+}
+
+
+def count_script_characters(text: str, language: str) -> int:
+    if language == "tel":
+        return sum("\u0c00" <= char <= "\u0c7f" for char in text)
+
+    if language == "hin":
+        return sum("\u0900" <= char <= "\u097f" for char in text)
+
+    return sum(char.isascii() and char.isalpha() for char in text)
+
+
+def preprocess_image(image: Image.Image) -> Image.Image:
+    image = ImageOps.grayscale(image)
+    image = ImageOps.autocontrast(image)
+    image = ImageEnhance.Contrast(image).enhance(1.5)
+
+    image = image.resize(
+        (image.width * 2, image.height * 2),
+        Image.Resampling.LANCZOS,
+    )
+
+    return image
+
+
+@router.post("/ocr")
+async def extract_inscription_text(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    if not file.content_type or not file.content_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Please upload an image.")
+
+    image_bytes = await file.read()
+
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="The uploaded image is empty.")
+
+    if len(image_bytes) > MAX_IMAGE_SIZE:
+        raise HTTPException(status_code=413, detail="Image must be smaller than 10 MB.")
+
+    try:
+        image = Image.open(BytesIO(image_bytes))
+        image.verify()
+
+        image = Image.open(BytesIO(image_bytes)).convert("RGB")
+        processed_image = preprocess_image(image)
+
+    except (
+        UnidentifiedImageError,
+        OSError,
+        Image.DecompressionBombError,
+    ):
+        raise HTTPException(status_code=400, detail="Invalid or unsupported image.")
+
+    try:
+        candidates = []
+
+        for model_code, model_name in OCR_MODELS.items():
+            text = pytesseract.image_to_string(
+                processed_image,
+                lang=model_code,
+                config="--psm 3",
+            ).strip()
+
+            if not text:
+                continue
+
+            script_count = count_script_characters(text, model_code)
+            total_letters = sum(char.isalpha() for char in text)
+
+            script_ratio = (
+                script_count / total_letters
+                if total_letters
+                else 0
+            )
+
+            confidence_data = pytesseract.image_to_data(
+                processed_image,
+                lang=model_code,
+                config="--psm 3",
+                output_type=pytesseract.Output.DICT,
+            )
+
+            confidences = [
+                float(value)
+                for value in confidence_data["conf"]
+                if str(value).strip() not in ("", "-1")
+                and float(value) >= 0
+            ]
+
+            average_confidence = (
+                sum(confidences) / len(confidences)
+                if confidences
+                else 0
+            )
+
+            score = (
+                script_count * 3
+                + script_ratio * 100
+                + average_confidence * 0.1
+            )
+
+            candidates.append({
+                "text": text,
+                "language": model_name,
+                "score": score,
+                "script_count": script_count,
+            })
+
+        if candidates:
+            best_result = max(
+                candidates,
+                key=lambda item: item["score"],
+            )
+
+            extracted_text = best_result["text"]
+            detected_language = best_result["language"]
+        else:
+            extracted_text = ""
+            detected_language = "Unknown"
+
+    except pytesseract.TesseractNotFoundError:
+        raise HTTPException(
+            status_code=500,
+            detail="OCR engine is not installed.",
+        )
+
+    except pytesseract.TesseractError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"OCR processing failed: {error}",
+        )
+
+    return {
+        "success": True,
+        "filename": file.filename,
+        "language": detected_language,
+        "extracted_text": extracted_text,
+        "word_count": len(extracted_text.split()),
+        "message": (
+            "Text extracted successfully."
+            if extracted_text
+            else "No readable text found. Try a clearer image."
+        ),
+    }
+
+
+class TranslationRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=12000)
+    source_language: str = Field(default="Unknown", max_length=100)
+
+
+class TranslationResponse(BaseModel):
+    translated_text: str
+    source_language: str
+
+
+@router.post("/translate", response_model=TranslationResponse)
+def translate_inscription(
+    request: TranslationRequest,
+    current_user: User = Depends(get_current_user),
+):
+    api_key = os.getenv("GEMINI_API_KEY")
+
+    if not api_key:
+        raise HTTPException(
+            status_code=503,
+            detail="Gemini API key is not configured.",
+        )
+
+    prompt = f"""
+You are an expert translator of historical inscriptions.
+
+SOURCE LANGUAGE SELECTED BY USER: {request.source_language}
+
+LANGUAGE HANDLING:
+- If the selection is Hindi, translate Hindi into English.
+- If the selection is Sanskrit, translate Sanskrit into English.
+- If the selection is Telugu, translate Telugu into English.
+- If the selection is English, preserve the English meaning and correct only obvious OCR errors.
+- If the selection is Devanagari (Hindi/Sanskrit), identify whether the text is Hindi or Sanskrit before translating. If uncertain, state that uncertainty rather than inventing a meaning.
+- If the selection is Unknown, identify the source language when possible.
+
+ORIGINAL OCR TEXT:
+{request.text}
+
+MANDATORY TRANSLATION RULES:
+
+1. Translate the complete source text into the ENGLISH LANGUAGE.
+2. Write the result using standard English alphabet (A-Z).
+3. Translate the meaning. NEVER transliterate or romanize the source text.
+4. For Devanagari text, translate Hindi/Sanskrit words into their
+   actual English meanings. Do not write Hindi words using English letters.
+5. Translate every readable line, sentence, phrase and word.
+6. Preserve the original order, dates, numbers, names and paragraph structure.
+7. Do not summarize, shorten, omit or skip any readable content.
+8. For genuinely unreadable OCR portions, write [unclear].
+9. Never invent historical facts or guess missing words.
+10. Return only the complete English translation.
+
+IMPORTANT:
+The output must be an English translation, not a phonetic representation
+of Hindi, Telugu, Sanskrit or any other language.
+"""
+
+    try:
+        client = genai.Client(api_key=api_key)
+
+        response = client.models.generate_content(
+            model="gemini-3.5-flash-lite",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=6000,
+            ),
+        )
+
+        if not response.text:
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini returned an empty translation.",
+            )
+
+        return TranslationResponse(
+            translated_text=response.text.strip(),
+            source_language=request.source_language,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as error:
+        logger.exception(
+            "Inscription translation failed: %s",
+            type(error).__name__,
+        )
+        raise HTTPException(
+            status_code=502,
+            detail="Translation failed. Please try again.",
+        )
+
+
+
